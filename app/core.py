@@ -65,6 +65,14 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 须不超过非负整数时限。枚举全部可行连通子树，选总风险分最高者，同分先选耗时更少、
 再选排序后 segment_id 列表字典序更小者；时限不足时返回仅含 source 的空路线，并给出
 按 segment_id 排序子节点的深度优先往返节点路径。
+
+``fault_sensor_placement`` 在 1～12 段的线路树（沿用 ``evaluate`` 的 segments 树校验，
+电阻 / 额定电流不参与计算）上选择故障测点：系统仅有正常或恰有任一线段断开两类状态，
+测点（非 source 节点）只报告是否仍与 source 连通——线段断开后仅其下游子树失电。
+对所选测点集合，按节点名升序逐测点生成每个状态的连通性布尔签名。枚举至多 12 个候选
+测点的全部子集（至多 2^12 = 4096 个），选出使正常状态与全部单段断线状态签名两两不同
+的最低总成本子集；同成本先取测点更少、再取升序节点名列表字典序更小者。全部候选测点
+仍无法区分时，返回不可区分的状态对（按状态描述符字典序升序，不重复）。
 """
 
 from __future__ import annotations
@@ -1803,4 +1811,155 @@ def inspection_route(segments_in: Sequence, segment_params_in: Sequence, max_min
         "total_risk_score": _round(best_risk),
         "total_minutes": best_time,
         "path": _walk(ROOT_NODE),
+    }
+
+
+def fault_sensor_placement(segments_in: Sequence, candidates_in: Sequence) -> dict:
+    """选择区分正常状态与全部单段断线状态的最低总成本测点集合。
+
+    线段列表沿用 ``evaluate`` 的树校验（电阻 / 额定电流不参与计算），候选测点
+    （至多 12 个）节点名称不得重复，须为已有的非 source 节点（不存在或为 source
+    返回 ``InputValidationError``）。系统仅有两种状态：正常（无线段断开），或恰有
+    一条线段断开；测点只报告是否仍与 source 连通——线段 s 断开后，恰为 s 子节点
+    子树（s 的全部下游节点）与 source 失联，其余节点保持连通。
+
+    对所选测点集合（签名按节点名升序的布尔连通性序列排列），枚举全部候选子集
+    （至多 2^12 = 4096 个），选出使正常状态与每个单段断线状态签名两两不同的最低
+    总成本（成本为正整数，精确比较）子集；同成本先取测点更少、再取升序节点名列表
+    字典序更小者。状态签名按「正常状态在前，断线状态按线段输入顺序」返回。全部
+    候选测点仍无法区分时，``feasible=false``，返回按状态描述符
+    （normal / fault_segment:<segment_id>）字典序升序、不重复的不可区分状态对。
+    """
+    segments, _ = _validate_and_build_tree(segments_in)
+
+    # 候选测点校验：节点不重复、须存在于树中且不能为根节点 source
+    known_nodes = {seg.child for seg in segments} | {ROOT_NODE}
+    errors: list[str] = []
+    seen_nodes: set[str] = set()
+    cost_map: dict[str, int] = {}
+    for candidate in candidates_in:
+        if candidate.node in seen_nodes:
+            errors.append(f"候选测点节点重复: '{candidate.node}'")
+        seen_nodes.add(candidate.node)
+        if candidate.node == ROOT_NODE:
+            errors.append(f"候选测点节点不能为根节点 '{ROOT_NODE}'（根节点恒与 source 连通）")
+        elif candidate.node not in known_nodes:
+            errors.append(f"候选测点节点 '{candidate.node}' 不存在于树中")
+        else:
+            cost_map[candidate.node] = candidate.cost
+    if errors:
+        raise InputValidationError("候选测点定义无效", errors)
+
+    children_map: dict[str, list[Segment]] = {}
+    for seg in segments:
+        children_map.setdefault(seg.parent, []).append(seg)
+
+    # 每条线段断开后失电的节点集合 = 其 child 子树的全部节点
+    lost_subtree: dict[str, set[str]] = {}
+    for seg in segments:
+        lost: set[str] = set()
+        stack = [seg.child]
+        while stack:
+            node = stack.pop()
+            lost.add(node)
+            stack.extend(child.child for child in children_map.get(node, []))
+        lost_subtree[seg.id] = lost
+
+    # 候选按节点名升序：签名列顺序与子集字典序均以此为准
+    candidate_nodes = sorted(cost_map)
+    n = len(candidate_nodes)
+
+    # 各状态对全部候选测点的连通性位向量（位 k = 1 表示候选 k 仍与 source 连通）
+    normal_bits = (1 << n) - 1
+    fault_bits: list[tuple[str, int]] = []
+    for seg in segments:  # 保持输入顺序
+        lost = lost_subtree[seg.id]
+        bits = normal_bits
+        for k, node in enumerate(candidate_nodes):
+            if node in lost:
+                bits &= ~(1 << k)
+        fault_bits.append((seg.id, bits))
+
+    def _state_descriptor(segment_id: Optional[str]) -> str:
+        return "normal" if segment_id is None else f"fault_segment:{segment_id}"
+
+    def _pair_record(seg_a: Optional[str], seg_b: Optional[str]) -> dict:
+        return {
+            "state_a": _state_descriptor(seg_a),
+            "state_b": _state_descriptor(seg_b),
+            "segment_id_a": seg_a,
+            "segment_id_b": seg_b,
+        }
+
+    def _signature_results(mask: int) -> list[dict]:
+        nodes = [candidate_nodes[k] for k in range(n) if mask >> k & 1]
+        signatures = [
+            {
+                "state": "normal",
+                "segment_id": None,
+                "nodes": nodes,
+                "connected": [True] * len(nodes),
+            }
+        ]
+        for seg_id, bits in fault_bits:
+            signatures.append(
+                {
+                    "state": "fault_segment",
+                    "segment_id": seg_id,
+                    "nodes": nodes,
+                    "connected": [bool(bits >> k & 1) for k in range(n) if mask >> k & 1],
+                }
+            )
+        return signatures
+
+    # 枚举全部候选子集（空集不具区分力，仅在无线段时可行，本接口至少 1 条线段）
+    best_mask: Optional[int] = None
+    best_cost = 0
+    best_size = 0
+    best_nodes: list[str] = []
+    for mask in range(1, 1 << n):
+        projected = [normal_bits & mask]
+        projected.extend(bits & mask for _, bits in fault_bits)
+        if len(set(projected)) != len(projected):
+            continue
+        selected = [candidate_nodes[k] for k in range(n) if mask >> k & 1]
+        total_cost = sum(cost_map[node] for node in selected)
+        size = len(selected)
+        if (
+            best_mask is None
+            or total_cost < best_cost
+            or (total_cost == best_cost and (size < best_size or (size == best_size and selected < best_nodes)))
+        ):
+            best_mask = mask
+            best_cost = total_cost
+            best_size = size
+            best_nodes = selected
+
+    if best_mask is not None:
+        return {
+            "feasible": True,
+            "selected_nodes": best_nodes,
+            "total_cost": best_cost,
+            "signatures": _signature_results(best_mask),
+            "indistinguishable_pairs": None,
+        }
+
+    # 选用全部候选测点仍不可行：收集全测点下签名相同的状态对
+    all_bits = [(None, normal_bits)] + [(seg_id, bits) for seg_id, bits in fault_bits]
+    pairs: list[dict] = []
+    for i in range(len(all_bits)):
+        for j in range(i + 1, len(all_bits)):
+            seg_i, bits_i = all_bits[i]
+            seg_j, bits_j = all_bits[j]
+            if bits_i == bits_j:
+                pair_a, pair_b = (seg_i, seg_j) if _state_descriptor(seg_i) <= _state_descriptor(seg_j) else (seg_j, seg_i)
+                pairs.append(_pair_record(pair_a, pair_b))
+    pairs.sort(key=lambda item: (item["state_a"], item["state_b"]))
+
+    return {
+        "feasible": False,
+        "selected_nodes": None,
+        "total_cost": None,
+        "signatures": None,
+        "indistinguishable_pairs": pairs,
     }

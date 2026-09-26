@@ -618,3 +618,68 @@ class InspectionRouteResponse(BaseModel):
         description="自 source 出发并返回的深度优先往返节点路径（子节点按 segment_id 升序）；"
         "空路线时仅含 source"
     )
+
+
+class SensorCandidateInput(BaseModel):
+    """一个候选测点节点及其正整数安装成本。"""
+
+    node: str = Field(min_length=1, description="候选测点节点名称（须为已有的非 source 节点）")
+    cost: int = Field(gt=0, description="测点安装成本，须为正整数")
+
+
+class FaultSensorPlacementRequest(BaseModel):
+    """故障测点布置请求：复用 segments 树校验，另给至多 12 个不同的非 source 候选节点。"""
+
+    segments: list[SegmentInput] = Field(
+        min_length=1,
+        max_length=12,
+        description="线段列表，须构成以 source 为根的连通树（1～12 段）；"
+        "电阻与额定电流不参与测点布置计算",
+    )
+    candidates: list[SensorCandidateInput] = Field(
+        min_length=1,
+        max_length=12,
+        description="候选测点列表（1～12 个）；节点名称不得重复，须为已有的非 source 节点",
+    )
+
+
+class StateSignatureResult(BaseModel):
+    state: str = Field(
+        description="状态：normal=正常（无线段断开），fault_segment=某条线段断开"
+    )
+    segment_id: Optional[str] = Field(
+        default=None, description="断开线段 id；state=normal 时为 null"
+    )
+    nodes: list[str] = Field(description="生成签名所用测点节点（按节点名升序）")
+    connected: list[bool] = Field(
+        description="各测点是否仍与 source 连通，顺序与 nodes 一致；true=连通，false=失电"
+    )
+
+
+class IndistinguishableStatePair(BaseModel):
+    state_a: str = Field(description="状态对之一：normal 或 fault_segment:<segment_id>")
+    state_b: str = Field(description="状态对之一：normal 或 fault_segment:<segment_id>")
+    segment_id_a: Optional[str] = Field(default=None, description="state_a 为断线状态时的线段 id，否则为 null")
+    segment_id_b: Optional[str] = Field(default=None, description="state_b 为断线状态时的线段 id，否则为 null")
+
+
+class FaultSensorPlacementResponse(BaseModel):
+    feasible: bool = Field(
+        description="存在使正常状态及全部单段断线状态签名两两不同的测点集合时为 true"
+    )
+    selected_nodes: Optional[list[str]] = Field(
+        default=None, description="选中的测点节点（按节点名升序）；feasible=false 时为 null"
+    )
+    total_cost: Optional[int] = Field(
+        default=None, description="选中测点安装成本之和；feasible=false 时为 null"
+    )
+    signatures: Optional[list[StateSignatureResult]] = Field(
+        default=None,
+        description="正常状态及各单段断线状态的签名（正常状态在前，断线状态按线段输入顺序）；"
+        "feasible=false 时为 null",
+    )
+    indistinguishable_pairs: Optional[list[IndistinguishableStatePair]] = Field(
+        default=None,
+        description="feasible=false 时，即便选用全部候选测点仍无法区分的状态对"
+        "（按状态描述符字典序升序，不重复）；feasible=true 时为 null",
+    )
