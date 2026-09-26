@@ -1,6 +1,6 @@
 # 直流配电树压降校核 API
 
-基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`），从多组已知负载工况与节点实测电压辨识配电树各段电阻（`/resistance-calibration`），或在 1～12 段线路树上按巡检时限选出总风险分最高的连通巡检子树并给出深度优先往返节点路径（`/inspection-route`）。
+基于 FastAPI 的直流配电树校核服务：输入以 `source` 为根的配电树（电源电压、线段电阻与额定电流、各节点恒定负载、最低允许电压），自叶向根累计每段承载的全部下游电流，再自根向叶计算压降与节点电压，返回各段电流、各节点电压以及超额定电流 / 欠压位置；并可评估指定节点可追加的最大恒定负载电流（`/capacity`），根据若干线段的实测电流定位唯一未登记正恒定负载的候选节点（`/unregistered-load`），评估至多 K 条负载同时升至峰值时各线段 / 各节点的最坏越限风险（`/peak-risk`），在故障线段断开后评估各候选跨接线的恢复方案并择优（`/outage-restoration`），枚举可切除负载组合、选出以最小切除电流消除全部超额定与欠压的切负荷方案（`/load-shedding`），按各线段保护曲线校核故障下各级保护的动作选择性并标出基线误动风险（`/protection-selectivity`），为 1～10 条待投运负载搜索每步启动瞬间均不越限的完整可行投运顺序（`/startup-order`），按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属（`/loss-allocation`），从多组已知负载工况与节点实测电压辨识配电树各段电阻（`/resistance-calibration`），在 1～12 段线路树上按巡检时限选出总风险分最高的连通巡检子树并给出深度优先往返节点路径（`/inspection-route`），或在 1～12 段线路树上选出区分正常与全部单段断线状态的最低总成本测点集合并给出各状态供电签名（`/fault-sensor-placement`）。
 
 ## 快速启动（单条命令）
 
@@ -32,6 +32,7 @@ docker compose up --build
 - 线损归属评估接口：`POST http://localhost:8000/loss-allocation`
 - 电阻辨识接口：`POST http://localhost:8000/resistance-calibration`
 - 巡检路线规划接口：`POST http://localhost:8000/inspection-route`
+- 故障测点部署接口：`POST http://localhost:8000/fault-sensor-placement`
 
 ## 请求格式
 
@@ -894,6 +895,75 @@ curl -X POST http://localhost:8000/inspection-route \
 }
 ```
 
+## 故障测点部署：POST /fault-sensor-placement
+
+`POST /fault-sensor-placement`，Content-Type: `application/json`。在 1～12 段的线路树上部署故障测点：请求沿用 `/evaluate` 的 `segments` 树校验（**线段电阻与额定电流不参与计算**），另给出至多 12 个不同的非 `source` 候选节点及各自正整数安装成本：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 1～12 条 | 线段列表，须构成以 `source` 为根的连通树（结构同 `/evaluate`） |
+| `candidates` | array | 1～12 个 | 候选测点列表，节点不得重复 |
+| `candidates[].node` | string | 必填 | 候选测点节点，须为已有的非 `source` 节点（重复 / 不存在 / 为 `source` 返回 `400 invalid_input`） |
+| `candidates[].cost` | integer | 正整数（> 0） | 安装成本（非正或非整数返回 `422`） |
+
+计算规则：
+
+- 假定系统仅有**正常**或**任意一条线段断开**两类状态（共 线段数 + 1 个）；节点测点只报告是否仍与 `source` 连通：断开某线段后，其子节点子树内的测点报告失电（0），其余测点报告连通（1）；
+- 为每种状态按所选测点生成**供电状态签名**：按 `selected_nodes` 升序逐位对应的 0/1 串；
+- 枚举全部测点子集，选出使正常状态与所有单段断线状态的签名**两两不同**的集合中**总成本最低**者；同成本先取**测点更少**、再取**升序节点名列表字典序更小**者（成本与测点数为整数精确比较）；
+- 全部候选测点仍无法使签名两两不同时返回 `status=indistinguishable` 与签名相同的**状态对**（按 `normal` 在前、线段输入顺序排列），方案字段为 `null`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/fault-sensor-placement \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"id": "s1", "parent": "source", "child": "a", "resistance": 0.1,  "rated_current": 20.0},
+      {"id": "s2", "parent": "a",      "child": "b", "resistance": 0.2,  "rated_current": 10.0},
+      {"id": "s3", "parent": "a",      "child": "c", "resistance": 0.05, "rated_current": 15.0}
+    ],
+    "candidates": [
+      {"node": "a", "cost": 2},
+      {"node": "b", "cost": 3},
+      {"node": "c", "cost": 3}
+    ]
+  }'
+```
+
+### 响应示例（200，solved）
+
+```json
+{
+  "status": "solved",
+  "selected_nodes": ["b", "c"],
+  "total_cost": 6,
+  "signatures": [
+    {"state": "normal", "signature": "11"},
+    {"state": "s1", "signature": "00"},
+    {"state": "s2", "signature": "01"},
+    {"state": "s3", "signature": "10"}
+  ],
+  "indistinguishable_pairs": null
+}
+```
+
+- 上例中最便宜的 `a`（成本 2）只能识别 `s1` 断开：`{a,b}` 中 `normal` 与 `s3` 同签名、`{a,c}` 中 `normal` 与 `s2` 同签名，`{a,b,c}` 可区分但成本 8 更高，故选中 `{b,c}`（成本 6）。
+- `signatures[]`：状态顺序为 `normal` 在前、随后按线段输入顺序；`signature` 按 `selected_nodes`（升序）逐位对应，`1`=仍与 `source` 连通，`0`=已失电。断开 `s2` 仅 `b` 失电（`01`），断开 `s3` 仅 `c` 失电（`10`），断开 `s1` 两者皆失电（`00`），与正常状态（`11`）两两不同。
+
+`indistinguishable` 响应示例（链式树 source→a→b→c 中叶子 `c` 未列为候选，`normal` 与 `s3` 断开时全部候选读数相同）：
+
+```json
+{
+  "status": "indistinguishable",
+  "selected_nodes": null,
+  "total_cost": null,
+  "signatures": null,
+  "indistinguishable_pairs": [["normal", "s3"]]
+}
+```
+
 ## 错误说明
 
 所有错误均返回统一结构：
@@ -910,11 +980,11 @@ curl -X POST http://localhost:8000/inspection-route \
 
 | 状态码 | code | 触发场景 |
 | --- | --- | --- |
-| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、`scenarios` 为空 / 工况电源电压非正或非有限数 / 测点电压非有限数、`tolerance` 为负或非有限数、巡检 `segments` 超过 12 条 / `segment_params` 为空 / 单程耗时非正整数 / 风险分非有限数 / 巡检时限为负或非整数、字段缺失或类型错误等 |
-| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中、电压测点节点工况内重复 / 不存在于树中 / 为 `source`、巡检参数线段 id 重复 / 不存在于树中 / 未覆盖全部线段 |
+| `422` | `validation_error` | 非正电源电压、负电阻、负负载电流、非正额定电流、实测电流为负或不是有限数（NaN/Infinity）、`peak_current` 为负或小于该负载 `current`、`max_simultaneous_peaks` 为负或缺失、`sheddable_loads` 超过 16 条 / 元素非整数、跨接线电阻为负 / 额定电流非正 / 必填字段缺失、保护曲线点电流非严格递增 / 曲线电流或动作时间为负或非有限数 / 曲线点为空 / 曲线或故障列表为空、故障电流非正或非有限数、最小级差为负或非有限数、`startup_loads` 不在 1～10 条范围内 / 待投运负载的稳态电流或启动电流为负或非有限数 / 启动电流小于稳态电流、`scenarios` 为空 / 工况电源电压非正或非有限数 / 测点电压非有限数、`tolerance` 为负或非有限数、巡检 `segments` 超过 12 条 / `segment_params` 为空 / 单程耗时非正整数 / 风险分非有限数 / 巡检时限为负或非整数、测点部署 `segments` 或 `candidates` 不在 1～12 条范围内 / 安装成本非正整数 / 候选节点为空字符串、字段缺失或类型错误等 |
+| `400` | `invalid_input` | 无效树（不连通、存在环路、节点多父节点、`source` 作为子节点、线段 id 重复）、负载引用不存在的节点、`target_node` 为 `source` / 不存在于树中、测量线段 id 重复 / 不存在于树中、故障线段不存在于树中，或跨接线 id 重复 / 与已有线段重复、供电侧 / 失电侧节点不存在或不在对应分量、`sheddable_loads` 序号越界（含负数）或重复、保护曲线未覆盖全部线段 / 线段 id 重复 / 曲线线段不存在于树中、故障节点不存在或为 `source`、待投运负载节点不存在于树中、电压测点节点工况内重复 / 不存在于树中 / 为 `source`、巡检参数线段 id 重复 / 不存在于树中 / 未覆盖全部线段、候选测点节点重复 / 不存在于树中 / 为 `source` |
 | `400` | `baseline_violation` | `/capacity` 与 `/startup-order` 基线校核（仅既有负载）已存在超额定电流或欠压，`details` 列出越限线段与节点 |
 
-注意：`/unregistered-load` 的 `inconsistent` / `undetermined` 与 `/resistance-calibration` 的 `undetermined` / `inconsistent` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
+注意：`/unregistered-load` 的 `inconsistent` / `undetermined`、`/resistance-calibration` 的 `undetermined` / `inconsistent` 与 `/fault-sensor-placement` 的 `indistinguishable` 是正常分析结论，以 `200` 返回并体现在响应体的 `status` 字段中，不属于上表错误。
 
 ## 本地开发与测试
 
@@ -929,7 +999,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py    # FastAPI 应用与错误处理
-  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属 + 电阻辨识 + 巡检路线规划
+  core.py    # 树校验 + 电流累计 + 压降计算 + 增容评估 + 未登记负载定位 + 峰值风险评估 + 故障恢复评估 + 切负荷方案 + 保护选择性校核 + 投运顺序搜索 + 线损归属 + 电阻辨识 + 巡检路线规划 + 故障测点部署
   models.py  # 请求 / 响应模型
 tests/
   test_evaluate.py
@@ -943,6 +1013,7 @@ tests/
   test_loss_allocation.py
   test_resistance_calibration.py
   test_inspection_route.py
+  test_fault_sensor_placement.py
 Dockerfile
 docker-compose.yml
 requirements.txt

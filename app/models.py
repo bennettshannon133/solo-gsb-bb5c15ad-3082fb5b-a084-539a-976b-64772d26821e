@@ -618,3 +618,60 @@ class InspectionRouteResponse(BaseModel):
         description="自 source 出发并返回的深度优先往返节点路径（子节点按 segment_id 升序）；"
         "空路线时仅含 source"
     )
+
+
+class SensorCandidateInput(BaseModel):
+    """一个候选测点：非 source 节点与正整数安装成本。"""
+
+    node: str = Field(
+        min_length=1, description="候选测点节点名称（须为已有的非 source 节点，列表内不得重复）"
+    )
+    cost: int = Field(gt=0, description="安装成本，须为正整数")
+
+
+class FaultSensorPlacementRequest(BaseModel):
+    """故障测点部署请求：沿用 /evaluate 的 segments 树校验（1～12 段），附加候选测点。"""
+
+    segments: list[SegmentInput] = Field(
+        min_length=1,
+        max_length=12,
+        description="线段列表，须构成以 source 为根的连通树（1～12 段）；"
+        "电阻与额定电流不参与测点部署计算",
+    )
+    candidates: list[SensorCandidateInput] = Field(
+        min_length=1,
+        max_length=12,
+        description="候选测点列表（1～12 个）：非 source 节点与正整数安装成本，节点不得重复",
+    )
+
+
+class StateSignatureResult(BaseModel):
+    state: str = Field(description="状态标识：normal=正常状态，其余为断开线段的 id")
+    signature: str = Field(
+        description="该状态下所选测点的供电状态签名：按 selected_nodes 升序逐位对应，"
+        "1=仍与 source 连通，0=已失电"
+    )
+
+
+class FaultSensorPlacementResponse(BaseModel):
+    status: str = Field(
+        description="求解结果：solved=存在使全部状态签名两两不同的测点集合，"
+        "indistinguishable=全部候选测点仍无法区分所有状态"
+    )
+    selected_nodes: Optional[list[str]] = Field(
+        default=None,
+        description="所选测点节点（按节点名升序）；indistinguishable 时为 null",
+    )
+    total_cost: Optional[int] = Field(
+        default=None, description="所选测点的安装成本总和；indistinguishable 时为 null"
+    )
+    signatures: Optional[list[StateSignatureResult]] = Field(
+        default=None,
+        description="正常状态与各单段断线状态（线段按输入顺序）的供电状态签名；"
+        "indistinguishable 时为 null",
+    )
+    indistinguishable_pairs: Optional[list[list[str]]] = Field(
+        default=None,
+        description="全部候选测点下签名仍相同的状态对（每对为 [状态A, 状态B]，"
+        "按 normal 在前、线段输入顺序排列）；solved 时为 null",
+    )

@@ -65,6 +65,14 @@ source 所在分量接入失电分量任意节点，失电分量从接入点重�
 须不超过非负整数时限。枚举全部可行连通子树，选总风险分最高者，同分先选耗时更少、
 再选排序后 segment_id 列表字典序更小者；时限不足时返回仅含 source 的空路线，并给出
 按 segment_id 排序子节点的深度优先往返节点路径。
+
+``fault_sensor_placement`` 在 1～12 段的线路树（沿用 ``evaluate`` 的 segments 树校验，
+电阻 / 额定电流不参与计算）上部署故障测点：候选测点为至多 12 个不同的非 source 节点，
+各配正整数安装成本。假定系统仅有「正常」或「任意一条线段断开」两类状态，节点测点只
+报告是否仍与 source 连通（断开线段后其子节点子树失电）；为每种状态按所选测点生成
+供电状态签名。枚举全部测点子集，选出使正常状态与所有单段断线状态的签名两两不同的
+最低总成本集合，同成本先取测点更少、再取升序节点名列表字典序更小者；全部候选测点
+仍无法两两区分时返回签名相同的状态对。
 """
 
 from __future__ import annotations
@@ -1803,4 +1811,115 @@ def inspection_route(segments_in: Sequence, segment_params_in: Sequence, max_min
         "total_risk_score": _round(best_risk),
         "total_minutes": best_time,
         "path": _walk(ROOT_NODE),
+    }
+
+
+def fault_sensor_placement(segments_in: Sequence, candidates_in: Sequence) -> dict:
+    """选出区分正常与全部单段断线状态的最低成本测点集合，返回可 JSON 序列化的结果字典。
+
+    线段列表沿用 ``evaluate`` 的树校验（电阻 / 额定电流不参与计算，由请求模型限制
+    1～12 段）；候选测点为 1～12 个不同的非 source 节点，各配正整数安装成本（条数与
+    成本上界由请求模型保证，节点存在性 / 非根 / 不重复由本函数校验）。假定系统仅有
+    「正常」或「任意一条线段断开」两类状态（共 线段数 + 1 个），节点测点只报告是否
+    仍与 source 连通：断开某线段后，其子节点子树内的测点报告失电（0），其余报告
+    连通（1）。每种状态按所选测点（按节点名升序）生成 0/1 供电状态签名。
+
+    枚举全部非空测点子集（至多 2^12 − 1 个；空集无法区分至少两个状态），选出使正常
+    状态与所有单段断线状态的签名两两不同的集合中总成本最低者，同成本先取测点更少、
+    再取升序节点名列表字典序更小者（成本与测点数为整数精确比较）。全部候选测点都
+    无法使签名两两不同时返回 ``indistinguishable`` 与签名相同的状态对（按 normal
+    在前、线段输入顺序排列）。
+    """
+    segments, parent_of = _validate_and_build_tree(segments_in)
+
+    # 候选测点校验：节点须为已有的非 source 节点且不重复
+    known_nodes = set(parent_of)
+    errors: list[str] = []
+    seen_nodes: set[str] = set()
+    for candidate in candidates_in:
+        node = candidate.node
+        if node in seen_nodes:
+            errors.append(f"候选测点节点重复: '{node}'")
+        seen_nodes.add(node)
+        if node == ROOT_NODE:
+            errors.append(f"候选测点节点不能为根节点 '{ROOT_NODE}'")
+        elif node not in known_nodes:
+            errors.append(f"候选测点节点 '{node}' 不存在于树中")
+    if errors:
+        raise InputValidationError("候选测点定义无效", errors)
+
+    # 状态：normal = 正常，其余为各线段断开（按线段输入顺序）
+    states = ["normal"] + [seg.id for seg in segments]
+    n_states = len(states)
+
+    # 候选节点按名称升序（签名位序与字典序决胜均按此顺序）
+    ordered = sorted(candidates_in, key=lambda c: c.node)
+    names = [c.node for c in ordered]
+    costs = [c.cost for c in ordered]
+    n = len(names)
+
+    # 各候选节点的连通状态位掩码：bit t = 1 表示状态 t 下仍与 source 连通；
+    # 断开其根路径上的任一线段即失电（正常状态恒连通）
+    seg_by_child = {seg.child: seg for seg in segments}
+    seg_state_bit = {seg.id: 1 << (1 + i) for i, seg in enumerate(segments)}
+    connected_mask: list[int] = []
+    for node in names:
+        lost = 0
+        current = node
+        while current != ROOT_NODE:
+            seg = seg_by_child[current]
+            lost |= seg_state_bit[seg.id]
+            current = seg.parent
+        connected_mask.append(((1 << n_states) - 1) ^ lost)
+
+    def _signatures(indices: tuple[int, ...]) -> list[tuple[int, ...]]:
+        """所选测点（候选升序序号）下各状态的签名元组（1=连通，0=失电）。"""
+        return [
+            tuple((connected_mask[j] >> t) & 1 for j in indices)
+            for t in range(n_states)
+        ]
+
+    # 枚举全部非空测点子集，按（总成本, 测点数, 升序节点名列表）字典序择优
+    best_key: Optional[tuple[int, int, tuple[str, ...]]] = None
+    best_indices: tuple[int, ...] = ()
+    for mask in range(1, 1 << n):
+        indices = tuple(j for j in range(n) if mask >> j & 1)
+        if len(set(_signatures(indices))) != n_states:
+            continue
+        key = (
+            sum(costs[j] for j in indices),
+            len(indices),
+            tuple(names[j] for j in indices),
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_indices = indices
+
+    if best_key is None:
+        # 全部候选测点仍无法区分：列出签名相同的状态对（按状态顺序）
+        all_signatures = _signatures(tuple(range(n)))
+        pairs = [
+            [states[t1], states[t2]]
+            for t1 in range(n_states)
+            for t2 in range(t1 + 1, n_states)
+            if all_signatures[t1] == all_signatures[t2]
+        ]
+        return {
+            "status": "indistinguishable",
+            "selected_nodes": None,
+            "total_cost": None,
+            "signatures": None,
+            "indistinguishable_pairs": pairs,
+        }
+
+    signatures = _signatures(best_indices)
+    return {
+        "status": "solved",
+        "selected_nodes": [names[j] for j in best_indices],
+        "total_cost": best_key[0],
+        "signatures": [
+            {"state": states[t], "signature": "".join(map(str, signatures[t]))}
+            for t in range(n_states)
+        ],
+        "indistinguishable_pairs": None,
     }

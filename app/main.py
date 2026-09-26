@@ -11,6 +11,7 @@ from .core import (
     InputValidationError,
     capacity,
     evaluate,
+    fault_sensor_placement,
     inspection_route,
     load_shedding,
     loss_allocation,
@@ -26,6 +27,8 @@ from .models import (
     CapacityResponse,
     EvaluateRequest,
     EvaluateResponse,
+    FaultSensorPlacementRequest,
+    FaultSensorPlacementResponse,
     InspectionRouteRequest,
     InspectionRouteResponse,
     LoadSheddingRequest,
@@ -61,9 +64,11 @@ app = FastAPI(
         "按未舍入基线线段电流计算逐段线损（P=I²R）并按负载输入序号逐条归属，"
         "从多组已知负载工况与节点实测电压辨识配电树各段电阻（输入线段电阻不参与拟合），"
         "或在 1～12 段线路树上按巡检时限选出总风险分最高的连通巡检子树，"
-        "并给出按 segment_id 排序子节点的深度优先往返节点路径。"
+        "并给出按 segment_id 排序子节点的深度优先往返节点路径，"
+        "或在 1～12 段线路树上选出区分正常与全部单段断线状态的最低总成本测点集合，"
+        "并给出各状态的供电状态签名。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -109,6 +114,8 @@ _FIELD_LABELS = {
     "travel_minutes": "单程耗时",
     "risk_score": "风险分",
     "max_minutes": "巡检时限",
+    "candidates": "候选测点列表",
+    "cost": "安装成本",
 }
 
 # measurements 内字段的中文标签（与负载字段同名时区分为“实测”）
@@ -151,6 +158,7 @@ _CUSTOM_MESSAGES = {
     ("tolerance", "greater_than_equal"): "残差容限不能为负（须 ≥ 0）",
     ("travel_minutes", "greater_than"): "单程耗时必须为正整数（> 0）",
     ("max_minutes", "greater_than_equal"): "巡检时限不能为负（须 ≥ 0）",
+    ("cost", "greater_than"): "安装成本必须为正整数（> 0）",
 }
 
 # curves 内字段的定制提示（“current” 与负载字段同名，须区分）
@@ -410,6 +418,18 @@ def inspection_route_endpoint(payload: InspectionRouteRequest) -> dict:
     )
 
 
+@app.post(
+    "/fault-sensor-placement",
+    response_model=FaultSensorPlacementResponse,
+    summary="选出区分正常与全部单段断线状态的最低总成本测点集合",
+)
+def fault_sensor_placement_endpoint(payload: FaultSensorPlacementRequest) -> dict:
+    return fault_sensor_placement(
+        segments_in=payload.segments,
+        candidates_in=payload.candidates,
+    )
+
+
 @app.get("/health", summary="健康检查")
 def health() -> dict:
     return {"status": "ok"}
@@ -428,6 +448,7 @@ def index() -> dict:
         "loss_allocation": "POST /loss-allocation",
         "resistance_calibration": "POST /resistance-calibration",
         "inspection_route": "POST /inspection-route",
+        "fault_sensor_placement": "POST /fault-sensor-placement",
         "docs": "/docs",
         "health": "/health",
     }
